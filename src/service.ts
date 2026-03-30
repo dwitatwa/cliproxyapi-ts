@@ -33,6 +33,7 @@ interface Credential {
   headers: Record<string, string>;
   excludedModels: Set<string>;
   planType: string;
+  configuredAliases: Array<{ name: string; alias: string }>;
   modelAliases: ResolvedModelAlias[];
   dynamicModelAliases: boolean;
   filePath?: string;
@@ -78,6 +79,14 @@ export class CodexProxyService {
     return this.config.port;
   }
 
+  get configSnapshot(): AppConfig {
+    return structuredClone(this.config);
+  }
+
+  get runtimeConfig(): AppConfig {
+    return this.config;
+  }
+
   get authDir(): string | undefined {
     return this.config.authDir;
   }
@@ -85,6 +94,25 @@ export class CodexProxyService {
   async reloadCredentials(): Promise<void> {
     this.credentials = await buildCredentials(this.config);
     this.roundRobinOffsets.clear();
+  }
+
+  async applyConfig(nextConfig: AppConfig): Promise<void> {
+    this.config.authDir = nextConfig.authDir;
+    this.config.proxyUrl = nextConfig.proxyUrl;
+    this.config.requestRetry = nextConfig.requestRetry;
+    this.config.managementKey = nextConfig.managementKey;
+    this.config.allowRemoteManagement = nextConfig.allowRemoteManagement;
+    this.config.debug = nextConfig.debug;
+    this.config.requestLog = nextConfig.requestLog;
+    this.config.usageStatisticsEnabled = nextConfig.usageStatisticsEnabled;
+    this.config.loggingToFile = nextConfig.loggingToFile;
+    this.config.quotaExceededSwitchProject = nextConfig.quotaExceededSwitchProject;
+    this.config.quotaExceededSwitchPreviewModel = nextConfig.quotaExceededSwitchPreviewModel;
+    this.config.forceModelPrefix = nextConfig.forceModelPrefix;
+    this.config.oauthExcludedModels = nextConfig.oauthExcludedModels;
+    this.config.oauthModelAlias = nextConfig.oauthModelAlias;
+    this.config.codexApiKey = nextConfig.codexApiKey;
+    await this.reloadCredentials();
   }
 
   listModels(): ModelInfo[] {
@@ -339,6 +367,9 @@ function resolveRequestedModel(credential: Credential, requestedModel: string): 
 
 async function buildCredentials(config: AppConfig): Promise<Credential[]> {
   const credentials: Credential[] = [];
+  const globalPrefix = (config.forceModelPrefix || "").trim();
+  const oauthAliases = config.oauthModelAlias.codex || [];
+  const oauthExcludedModels = config.oauthExcludedModels.codex || [];
 
   config.codexApiKey.forEach((entry, index) => {
     const token = (entry["api-key"] || "").trim();
@@ -352,20 +383,28 @@ async function buildCredentials(config: AppConfig): Promise<Credential[]> {
       token,
       baseUrl: (entry["base-url"] || "https://chatgpt.com/backend-api/codex").trim(),
       priority: typeof entry.priority === "number" ? entry.priority : 0,
-      prefix: (entry.prefix || "").trim(),
+      prefix: joinModelPrefix(globalPrefix, (entry.prefix || "").trim()),
       headers: normalizeHeaders(entry.headers),
       excludedModels: new Set(normalizeExcludedModels(entry["excluded-models"])),
       planType: "pro",
+      configuredAliases: (entry.models || []).map((model) => ({
+        name: (model.name || "").trim(),
+        alias: (model.alias || "").trim()
+      })),
       modelAliases: buildModelAliases((entry.models || []).map((model) => ({
         name: (model.name || "").trim(),
         alias: (model.alias || "").trim()
-      })), (entry.prefix || "").trim(), "pro"),
+      })), joinModelPrefix(globalPrefix, (entry.prefix || "").trim()), "pro"),
       dynamicModelAliases: (entry.models || []).length === 0
     });
   });
 
   for (const { filePath, auth } of await readCodexAuthFiles(config.authDir)) {
-    const credential = credentialFromAuthFile(filePath, auth);
+    const credential = credentialFromAuthFile(filePath, auth, {
+      prefix: globalPrefix,
+      aliases: oauthAliases,
+      excludedModels: oauthExcludedModels
+    });
     if (credential) {
       credentials.push(credential);
     }
@@ -374,7 +413,15 @@ async function buildCredentials(config: AppConfig): Promise<Credential[]> {
   return credentials;
 }
 
-function credentialFromAuthFile(filePath: string, auth: RawAuthFile): Credential | undefined {
+function credentialFromAuthFile(
+  filePath: string,
+  auth: RawAuthFile,
+  options: {
+    prefix: string;
+    aliases: Array<{ name?: string; alias?: string }>;
+    excludedModels: string[];
+  }
+): Credential | undefined {
   const attributes = auth.attributes || {};
   const metadata = auth.metadata || {};
   const token = typeof attributes.api_key === "string" && attributes.api_key.trim()
@@ -389,8 +436,12 @@ function credentialFromAuthFile(filePath: string, auth: RawAuthFile): Credential
     return undefined;
   }
 
-  const prefix = (auth.prefix || "").trim();
+  const prefix = joinModelPrefix(options.prefix, (auth.prefix || "").trim());
   const planType = readPlanType(attributes, metadata, auth);
+  const configuredAliases = options.aliases.map((model) => ({
+    name: (model.name || "").trim(),
+    alias: (model.alias || "").trim()
+  })).filter((model) => model.name && model.alias);
   const refreshToken = typeof metadata.refresh_token === "string" && metadata.refresh_token.trim()
     ? metadata.refresh_token.trim()
     : typeof auth.refresh_token === "string" && auth.refresh_token.trim()
@@ -426,9 +477,13 @@ function credentialFromAuthFile(filePath: string, auth: RawAuthFile): Credential
     priority: Number.parseInt(attributes.priority || "0", 10) || 0,
     prefix,
     headers: extractCustomHeaders(attributes),
-    excludedModels: new Set(splitCsv(attributes.excluded_models)),
+    excludedModels: new Set([
+      ...splitCsv(attributes.excluded_models),
+      ...options.excludedModels
+    ]),
     planType,
-    modelAliases: buildModelAliases([], prefix, planType),
+    configuredAliases,
+    modelAliases: buildModelAliases(configuredAliases, prefix, planType),
     dynamicModelAliases: true,
     filePath,
     email,
@@ -437,6 +492,11 @@ function credentialFromAuthFile(filePath: string, auth: RawAuthFile): Credential
     idToken,
     expiresAt
   };
+}
+
+function joinModelPrefix(globalPrefix: string, localPrefix: string): string {
+  const parts = [globalPrefix.trim(), localPrefix.trim()].filter(Boolean);
+  return parts.join("/");
 }
 
 function readPlanType(attributes: Record<string, string>, metadata: Record<string, unknown>, auth: RawAuthFile): string {
@@ -620,7 +680,7 @@ function applySavedTokenToCredential(credential: Credential, saved: CodexSavedTo
   if (planType !== credential.planType) {
     credential.planType = planType;
     if (credential.dynamicModelAliases) {
-      credential.modelAliases = buildModelAliases([], credential.prefix, planType);
+      credential.modelAliases = buildModelAliases(credential.configuredAliases, credential.prefix, planType);
     }
   }
 }

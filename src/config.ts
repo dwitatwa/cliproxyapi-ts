@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { parse as parseYaml } from "yaml";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 export interface CodexModelAliasConfig {
   name?: string;
@@ -39,10 +39,24 @@ export interface RawAuthFile {
 }
 
 export interface AppConfig {
+  configPath: string;
+  configFormat: "yaml" | "json";
   host: string;
   port: number;
   authDir?: string;
+  proxyUrl?: string;
   requestRetry: number;
+  managementKey?: string;
+  allowRemoteManagement: boolean;
+  debug: boolean;
+  requestLog: boolean;
+  usageStatisticsEnabled: boolean;
+  loggingToFile: boolean;
+  quotaExceededSwitchProject: boolean;
+  quotaExceededSwitchPreviewModel: boolean;
+  forceModelPrefix?: string;
+  oauthExcludedModels: Record<string, string[]>;
+  oauthModelAlias: Record<string, CodexModelAliasConfig[]>;
   codexApiKey: CodexKeyConfig[];
 }
 
@@ -53,12 +67,57 @@ export async function loadConfig(configPath: string): Promise<AppConfig> {
 
   const authDirRaw = typeof parsed["auth-dir"] === "string" ? parsed["auth-dir"] : undefined;
   return {
+    configPath: path.resolve(configPath),
+    configFormat: ext === ".json" ? "json" : "yaml",
     host: normalizeHost(parsed.host),
     port: normalizePort(parsed.port),
     authDir: authDirRaw ? path.resolve(path.dirname(configPath), authDirRaw) : undefined,
+    proxyUrl: normalizeOptionalString(parsed["proxy-url"]),
     requestRetry: normalizePositiveInt(parsed["request-retry"], 0),
+    managementKey: normalizeOptionalString(parsed["management-key"]) || normalizeOptionalString(process.env.MANAGEMENT_PASSWORD),
+    allowRemoteManagement: normalizeBoolean(parsed["allow-remote-management"], false),
+    debug: normalizeBoolean(parsed.debug, false),
+    requestLog: normalizeBoolean(parsed["request-log"], false),
+    usageStatisticsEnabled: normalizeBoolean(parsed["usage-statistics-enabled"], true),
+    loggingToFile: normalizeBoolean(parsed["logging-to-file"], false),
+    quotaExceededSwitchProject: normalizeBoolean(parsed["quota-exceeded-switch-project"], false),
+    quotaExceededSwitchPreviewModel: normalizeBoolean(parsed["quota-exceeded-switch-preview-model"], false),
+    forceModelPrefix: normalizeOptionalString(parsed["force-model-prefix"]),
+    oauthExcludedModels: normalizeOAuthExcludedModels(parsed["oauth-excluded-models"]),
+    oauthModelAlias: normalizeOAuthModelAlias(parsed["oauth-model-alias"]),
     codexApiKey: Array.isArray(parsed["codex-api-key"]) ? parsed["codex-api-key"] as CodexKeyConfig[] : []
   };
+}
+
+export async function saveConfig(config: AppConfig): Promise<void> {
+  const payload = {
+    host: config.host,
+    port: config.port,
+    ...(config.authDir ? { "auth-dir": toRelativeConfigPath(config.configPath, config.authDir) } : {}),
+    ...(config.proxyUrl ? { "proxy-url": config.proxyUrl } : {}),
+    "request-retry": config.requestRetry,
+    ...(config.managementKey ? { "management-key": config.managementKey } : {}),
+    "allow-remote-management": config.allowRemoteManagement,
+    debug: config.debug,
+    "request-log": config.requestLog,
+    "usage-statistics-enabled": config.usageStatisticsEnabled,
+    "logging-to-file": config.loggingToFile,
+    "quota-exceeded-switch-project": config.quotaExceededSwitchProject,
+    "quota-exceeded-switch-preview-model": config.quotaExceededSwitchPreviewModel,
+    ...(config.forceModelPrefix ? { "force-model-prefix": config.forceModelPrefix } : {}),
+    ...(Object.keys(config.oauthExcludedModels).length > 0 ? { "oauth-excluded-models": config.oauthExcludedModels } : {}),
+    ...(Object.keys(config.oauthModelAlias).length > 0 ? { "oauth-model-alias": config.oauthModelAlias } : {}),
+    "codex-api-key": config.codexApiKey
+  };
+
+  const data = config.configFormat === "json"
+    ? `${JSON.stringify(payload, null, 2)}\n`
+    : stringifyYaml(payload);
+  await fs.writeFile(config.configPath, data, "utf8");
+}
+
+export async function readConfigFileRaw(configPath: string): Promise<string> {
+  return fs.readFile(configPath, "utf8");
 }
 
 export async function readCodexAuthFiles(authDir: string | undefined): Promise<Array<{ filePath: string; auth: RawAuthFile }>> {
@@ -109,6 +168,85 @@ function normalizeHost(value: unknown): string {
   }
   const trimmed = value.trim();
   return trimmed || process.env.HOST?.trim() || "0.0.0.0";
+}
+
+function normalizeOptionalString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function normalizeBoolean(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "string") {
+    switch (value.trim().toLowerCase()) {
+      case "1":
+      case "true":
+      case "yes":
+      case "on":
+        return true;
+      case "0":
+      case "false":
+      case "no":
+      case "off":
+        return false;
+      default:
+        break;
+    }
+  }
+  return fallback;
+}
+
+function normalizeOAuthExcludedModels(value: unknown): Record<string, string[]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  const output: Record<string, string[]> = {};
+  for (const [key, models] of Object.entries(value as Record<string, unknown>)) {
+    if (!Array.isArray(models)) {
+      continue;
+    }
+    const normalized = models
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean);
+    if (normalized.length > 0) {
+      output[key.trim().toLowerCase()] = [...new Set(normalized)];
+    }
+  }
+  return output;
+}
+
+function normalizeOAuthModelAlias(value: unknown): Record<string, CodexModelAliasConfig[]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  const output: Record<string, CodexModelAliasConfig[]> = {};
+  for (const [key, aliases] of Object.entries(value as Record<string, unknown>)) {
+    if (!Array.isArray(aliases)) {
+      continue;
+    }
+    const normalized = aliases
+      .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null && !Array.isArray(item))
+      .map((item) => ({
+        name: typeof item.name === "string" ? item.name.trim() : "",
+        alias: typeof item.alias === "string" ? item.alias.trim() : ""
+      }))
+      .filter((item) => item.name && item.alias);
+    if (normalized.length > 0) {
+      output[key.trim().toLowerCase()] = normalized;
+    }
+  }
+  return output;
+}
+
+function toRelativeConfigPath(configPath: string, targetPath: string): string {
+  const relative = path.relative(path.dirname(configPath), targetPath);
+  return relative && !relative.startsWith("..") ? relative : targetPath;
 }
 
 function normalizePort(value: unknown): number {

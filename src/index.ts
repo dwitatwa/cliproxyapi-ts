@@ -6,6 +6,7 @@ import { loadConfig } from "./config.js";
 import { createApiServer } from "./server.js";
 import { CodexProxyService } from "./service.js";
 import { runCodexDeviceLogin, runCodexLogin } from "./auth/codex.js";
+import { startRuntimeWatchers } from "./watchers.js";
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
@@ -29,13 +30,15 @@ async function main(): Promise<void> {
 
   const service = await CodexProxyService.create(config);
   const server = createApiServer(service);
+  const stopWatchers = startRuntimeWatchers(service);
 
   server.listen(service.port, service.host, () => {
-    process.stdout.write(`CLIProxyAPI-TS listening on http://${service.host}:${service.port}\n`);
+    process.stdout.write(`CodexProxy listening on http://${service.host}:${service.port}\n`);
     process.stdout.write(`Config: ${configPath}\n`);
   });
 
   const shutdown = () => {
+    stopWatchers();
     server.close(() => process.exit(0));
   };
 

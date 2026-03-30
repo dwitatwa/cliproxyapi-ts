@@ -1,6 +1,19 @@
 host: 0.0.0.0
 port: 8317
 auth-dir: ./auths
+proxy-url: ""
+request-retry: 0
+management-key: ""
+allow-remote-management: false
+debug: false
+request-log: true
+usage-statistics-enabled: true
+logging-to-file: false
+quota-exceeded-switch-project: false
+quota-exceeded-switch-preview-model: false
+force-model-prefix: ""
+oauth-excluded-models: {}
+oauth-model-alias: {}
 
 codex-api-key:
   - api-key: your-token-here-v1

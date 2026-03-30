@@ -12,9 +12,15 @@ interface CreateApiServerOptions {
 export function createApiServer(service: CodexProxyService, options: CreateApiServerOptions = {}) {
   const managementApi = new CodexManagementApi(service, options.managementCallbackPort);
   const server = createServer(async (req, res) => {
+    const url = new URL(req.url || "/", "http://localhost");
+    const requestId = managementApi.beginRequest(req, url);
+    res.once("finish", () => {
+      managementApi.finishRequest(requestId, res.statusCode || 0);
+    });
     try {
-      await handleRequest(service, managementApi, req, res);
+      await handleRequest(service, managementApi, req, res, url, requestId);
     } catch (error) {
+      managementApi.annotateRequest(requestId, { error: errorMessage(error) });
       await writeJson(res, error instanceof HttpError ? error.statusCode : 500, buildOpenAiError(
         error instanceof HttpError ? error.statusCode : 500,
         errorMessage(error)
@@ -32,19 +38,21 @@ async function handleRequest(
   service: CodexProxyService,
   managementApi: CodexManagementApi,
   req: IncomingMessage,
-  res: ServerResponse
+  res: ServerResponse,
+  url: URL,
+  requestId: string
 ): Promise<void> {
   const method = req.method || "GET";
-  const url = new URL(req.url || "/", "http://localhost");
 
   if (method === "GET" && url.pathname === "/") {
     await writeJson(res, 200, {
-      message: "CLIProxyAPI TypeScript",
+      message: "CodexProxy",
       supported_providers: ["chatgpt", "codex"],
       endpoints: [
         "GET /v1/models",
         "GET /v1/responses (WebSocket)",
         "POST /v1/chat/completions",
+        "POST /v1/completions",
         "POST /v1/responses",
         "POST /v1/responses/compact",
         "GET /v0/management/auth-files",
@@ -89,6 +97,7 @@ async function handleRequest(
 
   if (url.pathname.startsWith("/v1/") && ![
     "/v1/chat/completions",
+    "/v1/completions",
     "/v1/responses",
     "/v1/responses/compact",
     "/v1/models"
@@ -101,6 +110,9 @@ async function handleRequest(
   }
 
   const body = await readJsonBody(req);
+  if (typeof body.model === "string" && body.model.trim()) {
+    managementApi.annotateRequest(requestId, { model: body.model.trim() });
+  }
   const streamRequested = body.stream === true;
   const incomingHeaders = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {
@@ -116,6 +128,12 @@ async function handleRequest(
 
   if (url.pathname === "/v1/chat/completions") {
     const response = await service.handleChatCompletions(body, streamRequested, abortController.signal, incomingHeaders);
+    await writeResponse(res, response);
+    return;
+  }
+
+  if (url.pathname === "/v1/completions") {
+    const response = await handleCompletions(service, body, streamRequested, abortController.signal, incomingHeaders);
     await writeResponse(res, response);
     return;
   }
@@ -138,6 +156,67 @@ async function handleRequest(
   throw new HttpError(404, "Not found");
 }
 
+async function handleCompletions(
+  service: CodexProxyService,
+  body: Record<string, unknown>,
+  stream: boolean,
+  abortSignal: AbortSignal,
+  incomingHeaders: Headers
+): Promise<Response | ForwardResponse> {
+  const prompt = Array.isArray(body.prompt)
+    ? body.prompt.filter((item): item is string => typeof item === "string").join("\n")
+    : typeof body.prompt === "string"
+      ? body.prompt
+      : "";
+  const chatBody: Record<string, unknown> = {
+    ...body,
+    messages: [{ role: "user", content: prompt }]
+  };
+  delete chatBody.prompt;
+
+  const chatResponse = await service.handleChatCompletions(chatBody, stream, abortSignal, incomingHeaders);
+  if (!stream) {
+    const payload = await unwrapJsonForwardResponse(chatResponse);
+    return jsonForwardResponse(convertChatCompletionToLegacyCompletion(payload, body));
+  }
+
+  if (!(chatResponse instanceof Response) || !chatResponse.body) {
+    throw new HttpError(502, "Streaming chat completion did not return a stream");
+  }
+  const chatStream = chatResponse.body;
+
+  const encoder = new TextEncoder();
+  const readable = new ReadableStream<Uint8Array>({
+    start: async (controller) => {
+      try {
+        for await (const payload of iterateSsePayloads(chatStream)) {
+          if (payload === "[DONE]") {
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            break;
+          }
+          const event = JSON.parse(payload) as Record<string, unknown>;
+          const chunk = convertChatStreamChunkToCompletionChunk(event, body);
+          if (chunk) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+          }
+        }
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      }
+    }
+  });
+
+  return new Response(readable, {
+    status: 200,
+    headers: new Headers({
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive"
+    })
+  });
+}
+
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
@@ -151,6 +230,91 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
     return JSON.parse(body) as Record<string, unknown>;
   } catch (error) {
     throw new HttpError(400, `Invalid JSON body: ${errorMessage(error)}`);
+  }
+}
+
+async function unwrapJsonForwardResponse(response: Response | ForwardResponse): Promise<Record<string, unknown>> {
+  if (response instanceof Response) {
+    return await response.json() as Record<string, unknown>;
+  }
+  return JSON.parse(Buffer.from(response.body).toString("utf8")) as Record<string, unknown>;
+}
+
+function convertChatCompletionToLegacyCompletion(
+  chat: Record<string, unknown>,
+  originalRequest: Record<string, unknown>
+): Record<string, unknown> {
+  const choices = Array.isArray(chat.choices) ? chat.choices as Array<Record<string, unknown>> : [];
+  const first = choices[0] || {};
+  const message = typeof first.message === "object" && first.message !== null ? first.message as Record<string, unknown> : {};
+  const text = typeof message.content === "string" ? message.content : "";
+  return {
+    id: chat.id,
+    object: "text_completion",
+    created: chat.created,
+    model: chat.model || originalRequest.model,
+    choices: [{
+      text,
+      index: typeof first.index === "number" ? first.index : 0,
+      logprobs: null,
+      finish_reason: typeof first.finish_reason === "string" ? first.finish_reason : null
+    }],
+    ...(chat.usage ? { usage: chat.usage } : {})
+  };
+}
+
+function convertChatStreamChunkToCompletionChunk(
+  chunk: Record<string, unknown>,
+  originalRequest: Record<string, unknown>
+): Record<string, unknown> | null {
+  const choices = Array.isArray(chunk.choices) ? chunk.choices as Array<Record<string, unknown>> : [];
+  const first = choices[0];
+  if (!first) {
+    return null;
+  }
+  const delta = typeof first.delta === "object" && first.delta !== null ? first.delta as Record<string, unknown> : {};
+  const text = typeof delta.content === "string" ? delta.content : "";
+  return {
+    id: chunk.id,
+    object: "text_completion",
+    created: chunk.created,
+    model: chunk.model || originalRequest.model,
+    choices: [{
+      text,
+      index: typeof first.index === "number" ? first.index : 0,
+      logprobs: null,
+      finish_reason: typeof first.finish_reason === "string" ? first.finish_reason : null
+    }]
+  };
+}
+
+function jsonForwardResponse(payload: unknown): ForwardResponse {
+  return {
+    status: 200,
+    headers: new Headers({ "content-type": "application/json" }),
+    body: new TextEncoder().encode(JSON.stringify(payload))
+  };
+}
+
+async function* iterateSsePayloads(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for await (const chunk of iterateReadableStream(stream)) {
+    buffer += decoder.decode(chunk, { stream: true });
+    let newlineIndex = buffer.indexOf("\n");
+    while (newlineIndex >= 0) {
+      const line = buffer.slice(0, newlineIndex).replace(/\r$/, "");
+      buffer = buffer.slice(newlineIndex + 1);
+      if (line.startsWith("data:")) {
+        yield line.slice(5).trim();
+      }
+      newlineIndex = buffer.indexOf("\n");
+    }
+  }
+  buffer += decoder.decode();
+  const finalLine = buffer.trim();
+  if (finalLine.startsWith("data:")) {
+    yield finalLine.slice(5).trim();
   }
 }
 

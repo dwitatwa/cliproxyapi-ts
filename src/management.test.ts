@@ -7,7 +7,7 @@ import test from "node:test";
 import { once } from "node:events";
 import { createApiServer } from "./server.js";
 import { CodexProxyService } from "./service.js";
-import type { AppConfig } from "./config.js";
+import { saveConfig, type AppConfig } from "./config.js";
 
 function buildUnsignedJwt(payload: object): string {
   const encode = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
@@ -32,12 +32,27 @@ async function getAvailablePort(): Promise<number> {
 async function startTestServer(authDir: string, callbackPort: number) {
   const port = await getAvailablePort();
   const config: AppConfig = {
+    configPath: path.join(authDir, "config.yaml"),
+    configFormat: "yaml",
     host: "127.0.0.1",
     port,
     authDir,
+    proxyUrl: undefined,
     requestRetry: 0,
+    managementKey: undefined,
+    allowRemoteManagement: false,
+    debug: false,
+    requestLog: false,
+    usageStatisticsEnabled: true,
+    loggingToFile: false,
+    quotaExceededSwitchProject: false,
+    quotaExceededSwitchPreviewModel: false,
+    forceModelPrefix: undefined,
+    oauthExcludedModels: {},
+    oauthModelAlias: {},
     codexApiKey: []
   };
+  await saveConfig(config);
   const service = await CodexProxyService.create(config);
   const server = createApiServer(service, { managementCallbackPort: callbackPort });
   server.listen(port, "127.0.0.1");
@@ -62,7 +77,7 @@ async function stopTestServer(server: ReturnType<typeof createApiServer>): Promi
 }
 
 test("management auth-file routes update disk state and live models", async () => {
-  const authDir = await mkdtemp(path.join(tmpdir(), "cliproxyapi-ts-management-"));
+  const authDir = await mkdtemp(path.join(tmpdir(), "codexproxy-management-"));
   const callbackPort = await getAvailablePort();
   const { server, baseUrl } = await startTestServer(authDir, callbackPort);
   const fileName = "codex-user@example.com-plus.json";
@@ -162,7 +177,7 @@ test("management auth-file routes update disk state and live models", async () =
 });
 
 test("management codex auth-url creates a pending oauth session", async () => {
-  const authDir = await mkdtemp(path.join(tmpdir(), "cliproxyapi-ts-oauth-"));
+  const authDir = await mkdtemp(path.join(tmpdir(), "codexproxy-oauth-"));
   const callbackPort = await getAvailablePort();
   const { server, baseUrl } = await startTestServer(authDir, callbackPort);
 
@@ -200,6 +215,127 @@ test("management codex auth-url creates a pending oauth session", async () => {
     statusPayload = await response.json() as { status: string; error?: string };
     assert.equal(statusPayload.status, "error");
     assert.equal(statusPayload.error, "access_denied");
+  } finally {
+    await stopTestServer(server);
+    await rm(authDir, { recursive: true, force: true });
+  }
+});
+
+test("management security and codex config routes work together", async () => {
+  const authDir = await mkdtemp(path.join(tmpdir(), "codexproxy-config-"));
+  const callbackPort = await getAvailablePort();
+  const { server, baseUrl, service } = await startTestServer(authDir, callbackPort);
+  service.runtimeConfig.managementKey = "secret-key";
+
+  try {
+    let response = await fetch(`${baseUrl}/v0/management/config`);
+    assert.equal(response.status, 401);
+
+    response = await fetch(`${baseUrl}/v0/management/codex-api-key`, {
+      method: "PUT",
+      headers: {
+        "content-type": "application/json",
+        "x-management-key": "secret-key"
+      },
+      body: JSON.stringify([{
+        "api-key": "api-key-1",
+        "base-url": "https://chatgpt.com/backend-api/codex",
+        priority: 100
+      }])
+    });
+    assert.equal(response.status, 200);
+
+    response = await fetch(`${baseUrl}/v0/management/config`, {
+      headers: {
+        "x-management-key": "secret-key"
+      }
+    });
+    assert.equal(response.status, 200);
+    const configPayload = await response.json() as { "codex-api-key": Array<{ "api-key": string }> };
+    assert.equal(configPayload["codex-api-key"][0]["api-key"], "api-key-1");
+
+    response = await fetch(`${baseUrl}/v1/models`);
+    const modelsPayload = await response.json() as { data: Array<{ id: string }> };
+    assert.ok(modelsPayload.data.some((model) => model.id === "gpt-5"));
+
+    response = await fetch(`${baseUrl}/v0/management/config.yaml`, {
+      headers: {
+        "x-management-key": "secret-key"
+      }
+    });
+    assert.equal(response.status, 200);
+    const yaml = await response.text();
+    assert.match(yaml, /codex-api-key:/);
+  } finally {
+    await stopTestServer(server);
+    await rm(authDir, { recursive: true, force: true });
+  }
+});
+
+test("oauth alias and excluded-model management updates live oauth models", async () => {
+  const authDir = await mkdtemp(path.join(tmpdir(), "codexproxy-oauth-models-"));
+  const callbackPort = await getAvailablePort();
+  const { server, baseUrl } = await startTestServer(authDir, callbackPort);
+  const fileName = "codex-user@example.com-plus.json";
+  const idToken = buildUnsignedJwt({
+    email: "user@example.com",
+    "https://api.openai.com/auth": {
+      chatgpt_account_id: "acct_123",
+      chatgpt_plan_type: "plus"
+    }
+  });
+
+  try {
+    let response = await fetch(`${baseUrl}/v0/management/auth-files?name=${encodeURIComponent(fileName)}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        type: "codex",
+        email: "user@example.com",
+        account_id: "acct_123",
+        access_token: "access-token",
+        refresh_token: "refresh-token",
+        id_token: idToken,
+        expired: "2026-04-09T13:59:01.852Z",
+        last_refresh: "2026-03-30T13:59:01.852Z"
+      })
+    });
+    assert.equal(response.status, 200);
+
+    response = await fetch(`${baseUrl}/v0/management/oauth-model-alias`, {
+      method: "PATCH",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        provider: "codex",
+        aliases: [{ name: "gpt-5", alias: "alias-gpt-5" }]
+      })
+    });
+    assert.equal(response.status, 200);
+
+    response = await fetch(`${baseUrl}/v1/models`);
+    let modelsPayload = await response.json() as { data: Array<{ id: string }> };
+    assert.ok(modelsPayload.data.some((model) => model.id === "alias-gpt-5"));
+    assert.ok(!modelsPayload.data.some((model) => model.id === "gpt-5"));
+
+    response = await fetch(`${baseUrl}/v0/management/oauth-excluded-models`, {
+      method: "PATCH",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        provider: "codex",
+        models: ["gpt-5"]
+      })
+    });
+    assert.equal(response.status, 200);
+
+    response = await fetch(`${baseUrl}/v1/models`);
+    modelsPayload = await response.json() as { data: Array<{ id: string }> };
+    assert.ok(!modelsPayload.data.some((model) => model.id === "alias-gpt-5"));
   } finally {
     await stopTestServer(server);
     await rm(authDir, { recursive: true, force: true });
