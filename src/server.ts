@@ -2,9 +2,10 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { URL } from "node:url";
 import { buildOpenAiError, errorMessage, HttpError } from "./errors.js";
 import { CodexProxyService, type ForwardResponse } from "./service.js";
+import { attachResponsesWebSocketHandler } from "./responses-websocket.js";
 
 export function createApiServer(service: CodexProxyService) {
-  return createServer(async (req, res) => {
+  const server = createServer(async (req, res) => {
     try {
       await handleRequest(service, req, res);
     } catch (error) {
@@ -14,6 +15,8 @@ export function createApiServer(service: CodexProxyService) {
       ));
     }
   });
+  attachResponsesWebSocketHandler(server, service);
+  return server;
 }
 
 async function handleRequest(service: CodexProxyService, req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -26,6 +29,7 @@ async function handleRequest(service: CodexProxyService, req: IncomingMessage, r
       supported_providers: ["chatgpt", "codex"],
       endpoints: [
         "GET /v1/models",
+        "GET /v1/responses (WebSocket)",
         "POST /v1/chat/completions",
         "POST /v1/responses",
         "POST /v1/responses/compact"
@@ -53,7 +57,7 @@ async function handleRequest(service: CodexProxyService, req: IncomingMessage, r
   }
 
   if (method === "GET" && url.pathname === "/v1/responses") {
-    throw new HttpError(501, "WebSocket responses transport is not implemented in the TypeScript port");
+    throw new HttpError(426, "Upgrade Required");
   }
 
   if (url.pathname.startsWith("/v0/management") || url.pathname === "/management.html") {

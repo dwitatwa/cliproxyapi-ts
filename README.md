@@ -7,6 +7,7 @@ Minimal TypeScript port of `CLIProxyAPI`, limited to ChatGPT/Codex.
 Supported:
 
 - `GET /v1/models`
+- `GET /v1/responses` websocket transport with `response.create` / `response.append`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `POST /v1/responses/compact`
@@ -19,7 +20,6 @@ Not supported:
 
 - Gemini, Claude, Qwen, Vertex, Amp, and management UI
 - the Go server's full watcher/reload/runtime-auth feature set
-- `GET /v1/responses` websocket transport
 
 ## Run
 
