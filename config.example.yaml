@@ -1,0 +1,18 @@
+host: 0.0.0.0
+port: 8317
+auth-dir: ./auths
+
+codex-api-key:
+  - api-key: your-token-here-v1
+    base-url: https://chatgpt.com/backend-api/codex
+    priority: 100
+    prefix: ""
+    headers:
+      Chatgpt-Account-Id: ""
+    models:
+      - name: gpt-5.4
+        alias: gpt-5.4
+      - name: gpt-5.3-codex
+        alias: gpt-5.3-codex
+      - name: gpt-5.3-codex-spark
+        alias: gpt-5.3-codex-spark
