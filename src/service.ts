@@ -56,7 +56,7 @@ export interface ForwardResponse {
 
 export class CodexProxyService {
   private readonly config: AppConfig;
-  private readonly credentials: Credential[];
+  private credentials: Credential[];
   private readonly roundRobinOffsets = new Map<string, number>();
   private readonly refreshInFlight = new Map<string, Promise<void>>();
 
@@ -67,9 +67,6 @@ export class CodexProxyService {
 
   static async create(config: AppConfig): Promise<CodexProxyService> {
     const credentials = await buildCredentials(config);
-    if (credentials.length === 0) {
-      throw new HttpError(500, "No ChatGPT/Codex credentials configured");
-    }
     return new CodexProxyService(config, credentials);
   }
 
@@ -79,6 +76,15 @@ export class CodexProxyService {
 
   get port(): number {
     return this.config.port;
+  }
+
+  get authDir(): string | undefined {
+    return this.config.authDir;
+  }
+
+  async reloadCredentials(): Promise<void> {
+    this.credentials = await buildCredentials(this.config);
+    this.roundRobinOffsets.clear();
   }
 
   listModels(): ModelInfo[] {
@@ -190,6 +196,9 @@ export class CodexProxyService {
   }
 
   private selectCredential(requestedModel: string): Selection {
+    if (this.credentials.length === 0) {
+      throw new HttpError(503, "No ChatGPT/Codex credentials configured");
+    }
     const key = requestedModel.trim().toLowerCase();
     const candidates = this.credentials
       .map((credential) => {

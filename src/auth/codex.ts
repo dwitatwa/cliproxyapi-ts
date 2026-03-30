@@ -36,12 +36,12 @@ export interface CodexSavedTokenFile {
   expired: string;
 }
 
-interface PkceCodes {
+export interface PkceCodes {
   codeVerifier: string;
   codeChallenge: string;
 }
 
-interface OAuthTokenResponse {
+export interface OAuthTokenResponse {
   access_token: string;
   refresh_token: string;
   id_token: string;
@@ -76,7 +76,7 @@ export async function runCodexLogin(config: AppConfig, options: LoginOptions = {
   const callback = await startOAuthCallbackServer(callbackPort);
 
   try {
-    const authUrl = buildAuthUrl(state, redirectUri, pkce);
+    const authUrl = buildCodexAuthUrl(state, redirectUri, pkce);
     process.stdout.write(`Open this URL to continue Codex login:\n${authUrl}\n`);
     if (!options.noBrowser) {
       await openBrowser(authUrl);
@@ -226,13 +226,13 @@ function requireAuthDir(config: AppConfig): string {
   return config.authDir;
 }
 
-function generatePkceCodes(): PkceCodes {
+export function generatePkceCodes(): PkceCodes {
   const codeVerifier = randomBytes(96).toString("base64url");
   const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
   return { codeVerifier, codeChallenge };
 }
 
-function buildAuthUrl(state: string, redirectUri: string, pkce: PkceCodes): string {
+export function buildCodexAuthUrl(state: string, redirectUri: string, pkce: PkceCodes): string {
   const params = new URLSearchParams({
     client_id: CLIENT_ID,
     response_type: "code",
@@ -248,7 +248,7 @@ function buildAuthUrl(state: string, redirectUri: string, pkce: PkceCodes): stri
   return `${AUTH_URL}?${params.toString()}`;
 }
 
-async function exchangeCodeForTokens(code: string, redirectUri: string, pkce: PkceCodes): Promise<OAuthTokenResponse> {
+export async function exchangeCodeForTokens(code: string, redirectUri: string, pkce: PkceCodes): Promise<OAuthTokenResponse> {
   const body = new URLSearchParams({
     grant_type: "authorization_code",
     client_id: CLIENT_ID,

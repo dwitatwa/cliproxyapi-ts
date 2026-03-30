@@ -3,11 +3,17 @@ import { URL } from "node:url";
 import { buildOpenAiError, errorMessage, HttpError } from "./errors.js";
 import { CodexProxyService, type ForwardResponse } from "./service.js";
 import { attachResponsesWebSocketHandler } from "./responses-websocket.js";
+import { CodexManagementApi } from "./management.js";
 
-export function createApiServer(service: CodexProxyService) {
+interface CreateApiServerOptions {
+  managementCallbackPort?: number;
+}
+
+export function createApiServer(service: CodexProxyService, options: CreateApiServerOptions = {}) {
+  const managementApi = new CodexManagementApi(service, options.managementCallbackPort);
   const server = createServer(async (req, res) => {
     try {
-      await handleRequest(service, req, res);
+      await handleRequest(service, managementApi, req, res);
     } catch (error) {
       await writeJson(res, error instanceof HttpError ? error.statusCode : 500, buildOpenAiError(
         error instanceof HttpError ? error.statusCode : 500,
@@ -16,10 +22,18 @@ export function createApiServer(service: CodexProxyService) {
     }
   });
   attachResponsesWebSocketHandler(server, service);
+  server.on("close", () => {
+    void managementApi.close();
+  });
   return server;
 }
 
-async function handleRequest(service: CodexProxyService, req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleRequest(
+  service: CodexProxyService,
+  managementApi: CodexManagementApi,
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
   const method = req.method || "GET";
   const url = new URL(req.url || "/", "http://localhost");
 
@@ -32,7 +46,9 @@ async function handleRequest(service: CodexProxyService, req: IncomingMessage, r
         "GET /v1/responses (WebSocket)",
         "POST /v1/chat/completions",
         "POST /v1/responses",
-        "POST /v1/responses/compact"
+        "POST /v1/responses/compact",
+        "GET /v0/management/auth-files",
+        "GET /v0/management/codex-auth-url"
       ]
     });
     return;
@@ -60,8 +76,15 @@ async function handleRequest(service: CodexProxyService, req: IncomingMessage, r
     throw new HttpError(426, "Upgrade Required");
   }
 
-  if (url.pathname.startsWith("/v0/management") || url.pathname === "/management.html") {
-    throw new HttpError(501, "Management endpoints are not implemented in the TypeScript port");
+  if (url.pathname.startsWith("/v0/management") || url.pathname === "/management.html" || url.pathname === "/codex/callback") {
+    try {
+      if (await managementApi.handleRequest(req, res, url)) {
+        return;
+      }
+    } catch (error) {
+      await writeManagementError(res, error);
+      return;
+    }
   }
 
   if (url.pathname.startsWith("/v1/") && ![
@@ -163,6 +186,14 @@ async function writeJson(res: ServerResponse, statusCode: number, payload: unkno
   res.statusCode = statusCode;
   res.setHeader("content-type", "application/json");
   res.end(JSON.stringify(payload));
+}
+
+async function writeManagementError(res: ServerResponse, error: unknown): Promise<void> {
+  const statusCode = error instanceof HttpError ? error.statusCode : 500;
+  await writeJson(res, statusCode, {
+    status: "error",
+    error: errorMessage(error)
+  });
 }
 
 async function* iterateReadableStream(stream: ReadableStream<Uint8Array>): AsyncGenerator<Uint8Array> {
