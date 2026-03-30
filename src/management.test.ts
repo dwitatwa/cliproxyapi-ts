@@ -341,3 +341,79 @@ test("oauth alias and excluded-model management updates live oauth models", asyn
     await rm(authDir, { recursive: true, force: true });
   }
 });
+
+test("management api-call uses auth_index token substitution", async () => {
+  const authDir = await mkdtemp(path.join(tmpdir(), "codexproxy-api-call-"));
+  const callbackPort = await getAvailablePort();
+  const upstreamPort = await getAvailablePort();
+  const { server, baseUrl } = await startTestServer(authDir, callbackPort);
+  const fileName = "codex-user@example.com-plus.json";
+  const idToken = buildUnsignedJwt({
+    email: "user@example.com",
+    "https://api.openai.com/auth": {
+      chatgpt_account_id: "acct_123",
+      chatgpt_plan_type: "plus"
+    }
+  });
+
+  const http = await import("node:http");
+  const upstreamHttp = http.createServer((req, res) => {
+    const payload = {
+      method: req.method,
+      authorization: req.headers.authorization || "",
+      custom: req.headers["x-custom"] || ""
+    };
+    res.statusCode = 200;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify(payload));
+  });
+
+  try {
+    upstreamHttp.listen(upstreamPort, "127.0.0.1");
+    await once(upstreamHttp, "listening");
+
+    let response = await fetch(`${baseUrl}/v0/management/auth-files?name=${encodeURIComponent(fileName)}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        type: "codex",
+        email: "user@example.com",
+        account_id: "acct_123",
+        access_token: "access-token",
+        refresh_token: "refresh-token",
+        id_token: idToken,
+        expired: "2030-04-09T13:59:01.852Z",
+        last_refresh: "2026-03-30T13:59:01.852Z"
+      })
+    });
+    assert.equal(response.status, 200);
+
+    response = await fetch(`${baseUrl}/v0/management/api-call`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        auth_index: `file:${fileName}`,
+        method: "GET",
+        url: `http://127.0.0.1:${upstreamPort}/hello`,
+        header: {
+          Authorization: "Bearer $TOKEN$",
+          "X-Custom": "ok"
+        }
+      })
+    });
+    assert.equal(response.status, 200);
+    const payload = await response.json() as { status_code: number; body: string };
+    assert.equal(payload.status_code, 200);
+    const upstreamPayload = JSON.parse(payload.body) as { authorization: string; custom: string };
+    assert.equal(upstreamPayload.authorization, "Bearer access-token");
+    assert.equal(upstreamPayload.custom, "ok");
+  } finally {
+    await new Promise<void>((resolve) => upstreamHttp.close(() => resolve()));
+    await stopTestServer(server);
+    await rm(authDir, { recursive: true, force: true });
+  }
+});

@@ -24,6 +24,7 @@ Supported:
 - `GET /v0/management/usage`
 - `GET /v0/management/usage/export`
 - `POST /v0/management/usage/import`
+- `POST /v0/management/api-call`
 - `GET/DELETE /v0/management/logs`
 - `GET /v0/management/request-log-by-id/:id`
 - `GET/PUT/PATCH /v0/management/quota-exceeded/switch-project`
@@ -98,8 +99,11 @@ Minimal examples:
 curl http://127.0.0.1:8317/v0/management/config
 curl http://127.0.0.1:8317/v0/management/codex-auth-url
 curl http://127.0.0.1:8317/v0/management/auth-files
+curl http://127.0.0.1:8317/v0/management/codex-api-key
 curl http://127.0.0.1:8317/v0/management/logs
 ```
+
+`auth-files` entries include `auth_index`, and `codex-api-key` entries expose `auth_index` in the form `codex-api-key:<index>`. Those can be used with `POST /v0/management/api-call` together with `$TOKEN$` substitution in request headers.
 
 ## Config
 

@@ -10,6 +10,7 @@ import {
   exchangeCodeForTokens,
   generatePkceCodes,
   parseCodexIdTokenClaims,
+  refreshCodexToken,
   writeCodexTokenFile,
   type PkceCodes,
   type CodexSavedTokenFile
@@ -26,6 +27,7 @@ import {
 import { HttpError, errorMessage } from "./errors.js";
 import { getPlanModels } from "./models.js";
 import { CodexProxyService } from "./service.js";
+import { ProxyAgent, fetch as undiciFetch } from "undici";
 
 const OAUTH_SESSION_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_CODEX_CALLBACK_PORT = 1455;
@@ -70,6 +72,15 @@ interface InFlightRequest {
   startedAt: number;
   model?: string;
   error?: string;
+}
+
+interface ApiCallCredential {
+  authIndex: string;
+  token?: string;
+  proxyUrl?: string;
+  fileName?: string;
+  filePath?: string;
+  auth?: RawAuthFile;
 }
 
 export class CodexManagementApi {
@@ -268,6 +279,11 @@ export class CodexManagementApi {
       return true;
     }
 
+    if (method === "POST" && url.pathname === "/v0/management/api-call") {
+      await this.apiCall(req, res);
+      return true;
+    }
+
     if (method === "DELETE" && url.pathname === "/v0/management/logs") {
       this.recentRequests.length = 0;
       await this.writeJson(res, 200, { status: "ok" });
@@ -309,7 +325,12 @@ export class CodexManagementApi {
     }
 
     if (method === "GET" && url.pathname === "/v0/management/codex-api-key") {
-      await this.writeJson(res, 200, { "codex-api-key": this.service.runtimeConfig.codexApiKey });
+      await this.writeJson(res, 200, {
+        "codex-api-key": this.service.runtimeConfig.codexApiKey.map((entry, index) => ({
+          ...entry,
+          auth_index: `codex-api-key:${index}`
+        }))
+      });
       return true;
     }
 
@@ -543,6 +564,136 @@ export class CodexManagementApi {
       total_requests: this.usage.total_requests,
       failed_requests: this.usage.failed_requests
     });
+  }
+
+  private async apiCall(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = await readJsonBody(req);
+    const method = typeof body.method === "string" ? body.method.trim().toUpperCase() : "";
+    const urlString = typeof body.url === "string" ? body.url.trim() : "";
+    if (!method) {
+      throw new HttpError(400, "missing method");
+    }
+    if (!urlString) {
+      throw new HttpError(400, "missing url");
+    }
+
+    let targetUrl: URL;
+    try {
+      targetUrl = new URL(urlString);
+    } catch {
+      throw new HttpError(400, "invalid url");
+    }
+    if (!targetUrl.protocol || !targetUrl.host) {
+      throw new HttpError(400, "invalid url");
+    }
+
+    const authIndex = firstDefinedString(body.auth_index, body.authIndex, body.AuthIndex)?.trim() || "";
+    const credential = await this.resolveApiCallCredential(authIndex);
+    const token = credential ? await this.resolveTokenForApiCallCredential(credential) : "";
+
+    const rawHeaders = body.header;
+    const headers = rawHeaders && typeof rawHeaders === "object" && !Array.isArray(rawHeaders)
+      ? normalizeStringMap(rawHeaders as Record<string, unknown>)
+      : {};
+    for (const [key, value] of Object.entries(headers)) {
+      if (value.includes("$TOKEN$")) {
+        if (!token) {
+          throw new HttpError(400, "auth token not found");
+        }
+        headers[key] = value.replaceAll("$TOKEN$", token);
+      }
+    }
+
+    const data = typeof body.data === "string" ? body.data : "";
+    const proxyUrl = credential?.proxyUrl?.trim() || this.service.runtimeConfig.proxyUrl?.trim() || "";
+    const dispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : undefined;
+
+    const response = await undiciFetch(targetUrl, {
+      method,
+      headers,
+      body: data || undefined,
+      dispatcher
+    });
+    const responseBody = await response.text();
+    const header: Record<string, string[]> = {};
+    response.headers.forEach((value, key) => {
+      header[key] = value.split(",").map((item) => item.trim()).filter(Boolean);
+    });
+
+    await this.writeJson(res, 200, {
+      status_code: response.status,
+      header,
+      body: responseBody
+    });
+  }
+
+  private async resolveApiCallCredential(authIndex: string): Promise<ApiCallCredential | null> {
+    const trimmed = authIndex.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    if (trimmed.startsWith("file:")) {
+      const name = trimmed.slice("file:".length);
+      const file = await this.readAuthFileByName(name);
+      return {
+        authIndex: trimmed,
+        token: readAuthToken(file.auth),
+        proxyUrl: file.auth.proxy_url || file.auth.attributes?.proxy_url || undefined,
+        fileName: file.name,
+        filePath: file.filePath,
+        auth: file.auth
+      };
+    }
+
+    if (trimmed.startsWith("codex-api-key:")) {
+      const index = Number.parseInt(trimmed.slice("codex-api-key:".length), 10);
+      if (!Number.isInteger(index) || index < 0 || index >= this.service.runtimeConfig.codexApiKey.length) {
+        throw new HttpError(404, "auth credential not found");
+      }
+      const entry = this.service.runtimeConfig.codexApiKey[index];
+      return {
+        authIndex: trimmed,
+        token: (entry["api-key"] || "").trim(),
+        proxyUrl: (entry["proxy-url"] || "").trim() || undefined
+      };
+    }
+
+    if (trimmed.toLowerCase().endsWith(".json")) {
+      const file = await this.readAuthFileByName(trimmed);
+      return {
+        authIndex: `file:${file.name}`,
+        token: readAuthToken(file.auth),
+        proxyUrl: file.auth.proxy_url || file.auth.attributes?.proxy_url || undefined,
+        fileName: file.name,
+        filePath: file.filePath,
+        auth: file.auth
+      };
+    }
+
+    throw new HttpError(404, "auth credential not found");
+  }
+
+  private async resolveTokenForApiCallCredential(credential: ApiCallCredential): Promise<string> {
+    if (!credential.auth) {
+      return credential.token || "";
+    }
+    const auth = credential.auth;
+    const token = readAuthToken(auth);
+    const expiresAt = readTokenExpiry(auth);
+    const refreshToken = readRefreshToken(auth);
+    if (!refreshToken || !shouldRefreshToken(expiresAt)) {
+      return token;
+    }
+
+    const refreshed = await refreshCodexToken(refreshToken);
+    const merged = mergeSavedTokenIntoAuth(auth, refreshed);
+    if (credential.fileName) {
+      await this.writeAuthFile(credential.fileName, merged);
+    }
+    credential.auth = merged;
+    credential.token = refreshed.access_token;
+    return refreshed.access_token;
   }
 
   private async putCodexKeys(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -1102,6 +1253,7 @@ export class CodexManagementApi {
       const planType = claims?.["https://api.openai.com/auth"]?.chatgpt_plan_type?.trim() || readAuthPlanType(auth);
       const entry: Record<string, unknown> = {
         id: path.basename(name, path.extname(name)),
+        auth_index: `file:${name}`,
         name,
         type: "codex",
         provider: "codex",
@@ -1293,6 +1445,73 @@ function normalizeManagedAuthFile(auth: RawAuthFile): RawAuthFile {
   return out;
 }
 
+function readAuthToken(auth: RawAuthFile): string {
+  return typeof auth.attributes?.api_key === "string" && auth.attributes.api_key.trim()
+    ? auth.attributes.api_key.trim()
+    : typeof auth.metadata?.access_token === "string" && auth.metadata.access_token.trim()
+      ? auth.metadata.access_token.trim()
+      : typeof auth.access_token === "string" && auth.access_token.trim()
+        ? auth.access_token.trim()
+        : typeof auth.metadata?.token === "string" && auth.metadata.token.trim()
+          ? auth.metadata.token.trim()
+          : typeof auth.metadata?.id_token === "string" && auth.metadata.id_token.trim()
+            ? auth.metadata.id_token.trim()
+            : typeof auth.metadata?.cookie === "string" && auth.metadata.cookie.trim()
+              ? auth.metadata.cookie.trim()
+              : "";
+}
+
+function readRefreshToken(auth: RawAuthFile): string {
+  return typeof auth.metadata?.refresh_token === "string" && auth.metadata.refresh_token.trim()
+    ? auth.metadata.refresh_token.trim()
+    : typeof auth.refresh_token === "string" && auth.refresh_token.trim()
+      ? auth.refresh_token.trim()
+      : "";
+}
+
+function readTokenExpiry(auth: RawAuthFile): string | undefined {
+  return typeof auth.metadata?.expired === "string" && auth.metadata.expired.trim()
+    ? auth.metadata.expired.trim()
+    : typeof auth.expired === "string" && auth.expired.trim()
+      ? auth.expired.trim()
+      : undefined;
+}
+
+function shouldRefreshToken(expiresAt: string | undefined): boolean {
+  if (!expiresAt) {
+    return false;
+  }
+  const parsed = Date.parse(expiresAt);
+  if (!Number.isFinite(parsed)) {
+    return false;
+  }
+  return parsed - Date.now() <= 5 * 60 * 1000;
+}
+
+function mergeSavedTokenIntoAuth(auth: RawAuthFile, saved: CodexSavedTokenFile): RawAuthFile {
+  const merged = normalizeManagedAuthFile({
+    ...auth,
+    access_token: saved.access_token,
+    refresh_token: saved.refresh_token,
+    id_token: saved.id_token,
+    account_id: saved.account_id,
+    email: saved.email,
+    expired: saved.expired,
+    last_refresh: saved.last_refresh,
+    metadata: {
+      ...(auth.metadata || {}),
+      access_token: saved.access_token,
+      refresh_token: saved.refresh_token,
+      id_token: saved.id_token,
+      account_id: saved.account_id,
+      email: saved.email,
+      expired: saved.expired,
+      last_refresh: saved.last_refresh
+    }
+  });
+  return merged;
+}
+
 function parseAuthFileUploadEnvelope(queryName: string | null, body: Record<string, unknown>): AuthFileEnvelope {
   if (queryName?.trim()) {
     return {
@@ -1351,6 +1570,15 @@ async function readRawBody(req: IncomingMessage): Promise<string> {
 
 function uniqueNames(names: string[]): string[] {
   return [...new Set(names.map((name) => sanitizeAuthFileName(name)).filter(Boolean))];
+}
+
+function firstDefinedString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) {
+      return value;
+    }
+  }
+  return undefined;
 }
 
 function sanitizeAuthFileName(rawName: string): string {
